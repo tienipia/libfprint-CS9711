@@ -7,6 +7,23 @@ This is a continuation of @ddlsmurf's [Chipsailing CS9711 driver](https://github
 while this author is very happy with the result, it should not be used for anything
 serious without serious testing.**
 
+## Diagnostics and a private Fedora package
+
+* `fprint-cs9711-diag` (`examples/cs9711-diag.c`) captures, enrolls, verifies
+  and cycles the reader with bounded timeouts. It reports when the sensor is
+  armed and emits JSON lines; it never writes images.
+* `packaging/rpm/` builds RPMs that install this fork privately below
+  `/usr/lib64/libfprint-cs9711` without replacing the distribution libfprint.
+  An optional subpackage points fprintd at it. See
+  [packaging/rpm/README.md](packaging/rpm/README.md) for limits, install,
+  rollback and hardware QA; [QA.json](packaging/rpm/QA.json) records the
+  tested RPM hashes and successful fprintd and sudo authentication.
+* `tests/test-cs9711-driver.c` runs the driver state machines against a
+  scripted USB transport (synthetic frames only).
+
+Repository agent instructions are in [CLAUDE.md](CLAUDE.md), shared through
+the `AGENTS.md` symlink.
+
 # Original `README.md` left below
 <hr />
 

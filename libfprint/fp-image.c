@@ -65,6 +65,7 @@ fp_image_finalize (GObject *object)
   g_clear_pointer (&self->data, g_free);
   g_clear_pointer (&self->binarized, g_free);
   g_clear_pointer (&self->minutiae, g_ptr_array_unref);
+  g_clear_pointer (&self->sigfm_info, sigfm_free_info);
 
   G_OBJECT_CLASS (fp_image_parent_class)->finalize (object);
 }
@@ -213,6 +214,7 @@ fp_image_sigfm_extract_cb (GObject * source_object, GAsyncResult * res,
 
       g_clear_pointer (&image->data, g_free);
       image->data = g_steal_pointer (&data->image);
+      g_clear_pointer (&image->sigfm_info, sigfm_free_info);
       image->sigfm_info = g_steal_pointer (&data->sigfm_info);
     }
 

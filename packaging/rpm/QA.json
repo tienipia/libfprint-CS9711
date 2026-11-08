@@ -1,0 +1,113 @@
+{
+  "tested_at": "2026-11-08T13:47:00+09:00",
+  "release": "1.94.10-0.2.20261101gitbab0cb2.dirty.fc44",
+  "environment": {
+    "os": "Fedora 44 Workstation x86_64",
+    "device": "LANStar LS-WINFG / USB FingPintAcl16",
+    "usb_id": "2541:2549",
+    "bcd_device": "0200",
+    "libfprint_distro": "1.94.100-1.fc44",
+    "fprintd": "1.94.5-5.fc44",
+    "selinux": "Enforcing",
+    "service_domain": "fprintd_t"
+  },
+  "result": "Installed and working with fprintd and sudo fingerprint authentication",
+  "packages": [
+    {
+      "file": "libfprint-cs9711-1.94.10-0.2.20261101gitbab0cb2.dirty.fc44.x86_64.rpm",
+      "sha256": "a266aef4b1ee9f5c290fe30aa1a0b3e8028ebc56773b75b679361c3cef5af0ed"
+    },
+    {
+      "file": "libfprint-cs9711-fprintd-1.94.10-0.2.20261101gitbab0cb2.dirty.fc44.x86_64.rpm",
+      "sha256": "bd05b17bc6c113a9bf4170c182314c29e38c589f4a14cd013be753a87d76a856"
+    }
+  ],
+  "verified": {
+    "direct_hardware": {
+      "enroll_stages": 15,
+      "verify_sequence": [
+        "right-index MATCH",
+        "right-middle NO MATCH",
+        "right-index MATCH"
+      ],
+      "asan_ubsan_errors": 0,
+      "cancel_and_reopen_cycles": 3,
+      "open_close_cycles": 20,
+      "timeout_s": [
+        180,
+        5
+      ]
+    },
+    "final_driver_sanitizers": {
+      "test_cases": 19,
+      "result": "PASS",
+      "suite": "ASAN and UBSAN cs9711-driver"
+    },
+    "cli_virtual_harness": {
+      "checks": 22,
+      "result": "PASS"
+    },
+    "rpm_check": {
+      "unit_suites": 5,
+      "result": "PASS"
+    },
+    "host_lifecycle": {
+      "release_0_1_install_remove_reinstall": "PASS",
+      "stock_file_digests_unchanged": true,
+      "pam_authselect_unchanged": true,
+      "offline_update_files_unchanged": true,
+      "private_files_removed_on_uninstall": true,
+      "stock_library_restored_on_uninstall": true,
+      "upgrade_0_1_to_0_2": "PASS"
+    },
+    "fprintd": {
+      "enroll_stages_including_duplicate_check": 16,
+      "enroll_result": "enroll-completed",
+      "same_finger": "verify-match",
+      "different_finger": "verify-no-match",
+      "reset_to_next_init_seconds": 1.581837
+    },
+    "sudo": {
+      "command": "sudo -k /usr/bin/id -u",
+      "password_entered": false,
+      "stdout": "0",
+      "exit_code": 0,
+      "debug_override_removed_before_test": true
+    },
+    "service_hardening": {
+      "MemoryDenyWriteExecute": true,
+      "ProtectSystem": "strict",
+      "ProtectHome": true
+    },
+    "cleanup": {
+      "temporary_biometric_images_and_templates_deleted": true,
+      "temporary_debug_dropin_removed": true,
+      "temporary_usb_acl_removed_by_replug": true,
+      "rootless_qa_container_removed": true,
+      "rootless_qa_image_removed": true
+    }
+  },
+  "fingerprint_storage": {
+    "persistent_system_enrollment": "right-index-finger retained for authentication",
+    "location": "/var/lib/fprint/<user>/cs9711",
+    "parent_directories": "root-owned mode 0700",
+    "contents_not_copied_to_repository": true,
+    "package_removal_does_not_delete_prints": true
+  },
+  "known_limits": [
+    "No false-accept/false-reject-rate or spoof-resistance measurement",
+    "1Password integration not tested",
+    "Legacy USB ids 2541:0236 and 2541:9711 have unit coverage only",
+    "Physical unplug occurred after capture had already finished; disconnect during active read is covered only by scripted USB tests",
+    "OpenCV-related startup attempts to read /proc/sys/vm/nr_hugepages are denied by SELinux; enrollment and sudo succeed without any policy changes",
+    "Private fork has 21 fewer supported USB ids than distribution libfprint; only this reader was present"
+  ],
+  "evidence_directory": "packaging/rpm/out/qa",
+  "source_note": "Binary RPM and SRPM contain the source/docs at build time. This post-build QA report and README pointer were added after physical verification; product source is unchanged.",
+  "remove_commands": [
+    "sudo rpm -e libfprint-cs9711-fprintd libfprint-cs9711",
+    "sudo systemctl daemon-reload",
+    "sudo systemctl restart fprintd"
+  ],
+  "delete_enrollment_if_desired_before_uninstall": "fprintd-delete <user>"
+}

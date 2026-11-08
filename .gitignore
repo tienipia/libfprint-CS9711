@@ -1,3 +1,14 @@
 *.o
 *.swp
 _build
+# Local build directories and packaging output
+/_build*/
+/build*/
+/packaging/rpm/out/
+*.rpm
+*.src.rpm
+libfprint-cs9711-*.tar.gz
+# Diagnostic tool output must never be committed (may hold biometric data)
+*.fpt
+*.pgm
+test-storage.variant

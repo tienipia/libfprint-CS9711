@@ -202,7 +202,15 @@ fpi_print_add_from_image (FpPrint *print,
   else if (print->type == FPI_PRINT_SIGFM)
     {
       SigfmImgInfo * info = fp_image_get_sigfm_info (image);
-      g_ptr_array_add (print->prints, info);
+
+      if (!info)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                       "No SIGFM data found in image or not yet extracted!");
+          return FALSE;
+        }
+      /* The image keeps its own copy and frees it when finalized. */
+      g_ptr_array_add (print->prints, sigfm_copy_info (info));
     }
 
   g_clear_object (&print->image);
@@ -294,10 +302,23 @@ fpi_print_sigfm_match (FpPrint * template, FpPrint * print,
         template->type);
       return FPI_MATCH_ERROR;
     }
+  if (print->type != FPI_PRINT_SIGFM || print->prints->len != 1 ||
+      g_ptr_array_index (print->prints, 0) == NULL)
+    {
+      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                         "New print must contain exactly one SIGFM print");
+      return FPI_MATCH_ERROR;
+    }
   SigfmImgInfo * against = g_ptr_array_index (print->prints, 0);
   for (int i = 0; i != template->prints->len; ++i)
     {
       SigfmImgInfo * pinfo = g_ptr_array_index (template->prints, i);
+      if (pinfo == NULL)
+        {
+          *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                             "Enrolled SIGFM print is empty");
+          return FPI_MATCH_ERROR;
+        }
       int score = sigfm_match_score (pinfo, against);
       if (score < 0)
         {

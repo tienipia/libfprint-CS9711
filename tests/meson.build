@@ -260,6 +260,32 @@ if 'cs9711' in supported_drivers
         c_args: common_cflags,
     )
     test('cs9711-variants', cs9711_variants_test, suite: ['unit-tests'], env: envs)
+
+    # Includes the driver source with a scripted USB transport. The public
+    # sources are compiled in as well, so that the binary holds one copy of
+    # libfprint and does not link the shared library.
+    cs9711_driver_test = executable('test-cs9711-driver',
+        sources: [
+            'test-cs9711-driver.c',
+            fp_enums,
+            files(
+                '../libfprint/fp-device.c',
+                '../libfprint/fp-image-device.c',
+                '../libfprint/fp-image.c',
+                '../libfprint/fp-print.c',
+            ),
+        ],
+        include_directories: include_directories('../libfprint'),
+        dependencies: deps,
+        link_with: libfprint_private,
+        c_args: common_cflags,
+        install: false,
+    )
+    test('cs9711-driver', cs9711_driver_test,
+        suite: ['unit-tests'],
+        env: envs,
+        timeout: 120,
+    )
 endif
 
 unit_tests = [

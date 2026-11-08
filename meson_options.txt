@@ -34,3 +34,7 @@ option('installed-tests',
        description: 'Whether to install the installed tests',
        type: 'boolean',
        value: true)
+option('cs9711-diag',
+       description: 'Install the fprint-cs9711-diag tool (it is always built)',
+       type: 'boolean',
+       value: false)

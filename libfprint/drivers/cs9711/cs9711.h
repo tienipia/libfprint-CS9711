@@ -42,10 +42,29 @@ struct _FpDeviceCs9711
 
   unsigned char image_buffer[CS9711_IMAGE_BUFFER_SIZE];
 
+  /* One activation (enroll, verify, identify or capture session).
+   * cancellable is cancelled when the action is cancelled or when the
+   * driver aborts; every asynchronous transfer uses it. */
+  GCancellable *cancellable;
+  GCancellable *action_cancellable;
+  gulong        action_cancel_id;
+
+  /* The running capture state machine, NULL when none is running. */
+  FpiSsm  *scan_ssm;
+  /* Error to report once the pending read of scan_ssm has been reaped. */
+  GError  *scan_error;
+  gboolean scan_delay_pending;
+  gboolean deactivating;
+
   /* Acl16 leaves extra bulk data queued after a frame. */
   guint8 acl16_drain_budget;
   guint8 acl16_init_retries;
+  guint8 acl16_rearms;
+  guint8 acl16_echoes;
   int acl16_after_drain;
+  /* Monotonic time (us) before which no command may follow the last
+   * post-scan reset. Kept across actions and open/close of this object. */
+  gint64 acl16_reset_deadline;
 };
 
 G_DECLARE_FINAL_TYPE (FpDeviceCs9711, fpi_device_cs9711, FPI, DEVICE_CS9711, FpImageDevice)

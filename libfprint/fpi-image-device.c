@@ -320,7 +320,8 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
   else if (action == FPI_DEVICE_ACTION_VERIFY)
     {
       FpPrint *template;
-      FpiMatchResult result;
+      /* Fail closed: only a matcher may turn this into a success. */
+      FpiMatchResult result = FPI_MATCH_ERROR;
 
       fpi_device_get_verify_data (device, &template);
       if (print)
@@ -331,10 +332,10 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
           else if (priv->algorithm == FPI_PRINT_SIGFM)
             result = fpi_print_sigfm_match (template, print, priv->score_threshold,
                                             &error);
-        }
-      else
-        {
-          result = FPI_MATCH_ERROR;
+          else
+            error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                              "Unsupported print algorithm %d",
+                                              priv->algorithm);
         }
 
       if (!error || error->domain == FP_DEVICE_RETRY)
@@ -360,6 +361,10 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
           else if (priv->algorithm == FPI_PRINT_SIGFM)
             match_result = fpi_print_sigfm_match (template, print,
                                                   priv->score_threshold, &error);
+          else
+            error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                              "Unsupported print algorithm %d",
+                                              priv->algorithm);
 
           if (match_result == FPI_MATCH_SUCCESS)
             {
@@ -672,6 +677,8 @@ fpi_image_device_activate_complete (FpImageDevice *self, GError *error)
   if (error)
     {
       g_debug ("Image device activation failed");
+      /* Leave ACTIVATING, or the next activation is an invalid transition. */
+      fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_INACTIVE);
       fpi_device_action_error (FP_DEVICE (self), error);
       return;
     }
