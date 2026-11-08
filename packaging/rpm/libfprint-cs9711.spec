@@ -29,7 +29,7 @@
 
 Name:           libfprint-cs9711
 Version:        1.94.10
-Release:        0.2.%{snapdate}git%{shortcommit}%{dirtytag}%{?dist}
+Release:        0.3.%{snapdate}git%{shortcommit}%{dirtytag}%{?dist}
 Summary:        Private libfprint build with the CS9711/Acl16 driver and diagnostics
 
 # Same terms as the distribution libfprint: LGPL-2.1-or-later (libfprint,
@@ -155,6 +155,11 @@ grep -qx 'Environment=LD_LIBRARY_PATH=%{privlib}' \
 %{_unitdir}/fprintd.service.d/50-libfprint-cs9711.conf
 
 %changelog
+* Sun Nov 08 2026 libfprint-CS9711 maintainers - 1.94.10-0.3
+- Acl16: consume the complete 9856-byte frame and retain the compatible image crop
+- Follow scan/stop protocol without repeated initialization or fixed capture delays
+- Add operation and frame-to-result timing to diagnostics
+
 * Sun Nov 08 2026 libfprint-CS9711 maintainers - 1.94.10-0.2
 - Acl16: keep the post-reset quiet period before the next action's init;
   fprintd enrollment stalled after its duplicate-check scan

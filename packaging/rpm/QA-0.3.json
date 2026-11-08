@@ -1,0 +1,270 @@
+{
+  "date": "2026-11-08T14:36:49.069469+09:00",
+  "status": "installed; physical enrollment, match, rejection, existing-template compatibility and fingerprint-only sudo passed",
+  "base_commit": "8747b45",
+  "release": "1.94.10-0.3.20261108git8747b45.dirty.fc44",
+  "environment": {
+    "host": "tienipia-workstation",
+    "os": "Fedora44",
+    "usb": "2541:2549",
+    "chip": "0x62a2",
+    "bcdDevice": "0200"
+  },
+  "artifacts": [
+    {
+      "path": "out/RPMS/x86_64/libfprint-cs9711-1.94.10-0.3.20261108git8747b45.dirty.fc44.x86_64.rpm",
+      "sha256": "740747fd1bab71026e4d14dba3a79089c29929af8c85999dae9cf2fcee94380d",
+      "size": 376893
+    },
+    {
+      "path": "out/RPMS/x86_64/libfprint-cs9711-fprintd-1.94.10-0.3.20261108git8747b45.dirty.fc44.x86_64.rpm",
+      "sha256": "579ab77887be58e6690cefdfa91a8a06cc9320eac42c78bad5737636ada78a49",
+      "size": 8683
+    }
+  ],
+  "software_tests": {
+    "unit_suites": "5/5",
+    "driver_cases": 23,
+    "asan_ubsan": "driver+variants pass; no sanitizer reports"
+  },
+  "physical_protocol_probes": {
+    "qa-direct-scan-2": {
+      "result": [
+        {
+          "t": 6.422508,
+          "event": "result",
+          "outcome": "three-frames"
+        }
+      ],
+      "frames": [
+        {
+          "t": 0.861257,
+          "event": "frame",
+          "attempt": 1,
+          "length": 8192
+        },
+        {
+          "t": 3.91877,
+          "event": "frame",
+          "attempt": 2,
+          "length": 8192
+        },
+        {
+          "t": 6.261853,
+          "event": "frame",
+          "attempt": 3,
+          "length": 8192
+        }
+      ],
+      "errors": []
+    },
+    "qa-full-frame-2": {
+      "result": [
+        {
+          "t": 179.265164,
+          "event": "result",
+          "outcome": "three-frames"
+        }
+      ],
+      "frames": [
+        {
+          "t": 174.30785,
+          "event": "frame",
+          "attempt": 1,
+          "length": 9856
+        },
+        {
+          "t": 176.364536,
+          "event": "frame",
+          "attempt": 2,
+          "length": 9856
+        },
+        {
+          "t": 179.264947,
+          "event": "frame",
+          "attempt": 3,
+          "length": 9856
+        }
+      ],
+      "errors": []
+    },
+    "qa-hold04": {
+      "result": [
+        {
+          "t": 64.789944,
+          "event": "result",
+          "extra_frames_in_hold_window": 0,
+          "hold_window_s": 10
+        }
+      ],
+      "frames": [
+        {
+          "t": 54.775764,
+          "event": "frame",
+          "length": 9856,
+          "extra": null
+        }
+      ],
+      "errors": []
+    },
+    "qa-cold-frame": {
+      "result": [
+        {
+          "t": 13.812954,
+          "event": "result",
+          "outcome": "cold-frame"
+        }
+      ],
+      "frames": [
+        {
+          "t": 13.812733,
+          "event": "frame",
+          "attempt": 1,
+          "length": 9856
+        }
+      ],
+      "errors": []
+    }
+  },
+  "timing": {
+    "metric": "operation start to scan armed; user reaction excluded; host matching reported separately",
+    "installed_0_2_seconds": [
+      1.599,
+      1.677,
+      1.651
+    ],
+    "rpm_0_3_seconds": [
+      0.081,
+      0.081,
+      0.081
+    ],
+    "samples_per_build": 3,
+    "method": "no-finger capture then clean timeout cancellation, extracted RPM uses explicit LD_LIBRARY_PATH",
+    "frame_to_match_ms": [
+      2,
+      2,
+      2
+    ],
+    "frame_to_match_note": "frame fully received to verdict in RAM-only enrolled template test; excludes sensor capture and USB transfer"
+  },
+  "pending": [],
+  "system_changes": {
+    "private_rpm_installed": "1.94.10-0.3.20261108git8747b45.dirty.fc44",
+    "protected_file_hashes": "unchanged including stock library, daemon, PAM/authselect and offline-update state",
+    "temporary_usb_acl": "removed after QA",
+    "temporary_middle_registration": "deleted; only original right-index retained",
+    "raw_fingerprint_images_saved": false,
+    "test_biometric_data_retained": false
+  },
+  "evidence_directory": "out/qa/latency-v03",
+  "limits": [
+    "one physical reader",
+    "no Windows execution; vendor binaries inspected statically only",
+    "112x73 crop and SIGFM threshold40 unchanged",
+    "End-to-end touch-to-verdict latency is not measured; ready and host-processing times are reported separately.",
+    "Package removal not rerun on host in this latency change; private paths and absence of scriptlets verified, packaging isolation unchanged from 0.2."
+  ],
+  "physical_libfprint": {
+    "outcomes": [
+      {
+        "t": 24.823,
+        "event": "result",
+        "op": "enroll",
+        "outcome": "enrolled",
+        "duration_s": 24.797,
+        "since_contact_s": 0.001
+      },
+      {
+        "t": 26.164,
+        "event": "result",
+        "op": "verify",
+        "attempt": 1,
+        "outcome": "match",
+        "duration_s": 1.341,
+        "since_contact_s": 0.002
+      },
+      {
+        "t": 27.566,
+        "event": "result",
+        "op": "verify",
+        "attempt": 2,
+        "outcome": "match",
+        "duration_s": 1.402,
+        "since_contact_s": 0.002
+      },
+      {
+        "t": 28.941,
+        "event": "result",
+        "op": "verify",
+        "attempt": 3,
+        "outcome": "match",
+        "duration_s": 1.375,
+        "since_contact_s": 0.002
+      }
+    ],
+    "enroll_stage_processing_ms": [
+      4,
+      1,
+      1,
+      1,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "matches_processing_ms": [
+      2,
+      2,
+      2
+    ],
+    "negative_test": "not exercised; repeated index touches completed all three before middle prompt"
+  },
+  "physical_fprintd": {
+    "existing_template_verify": "right-index verify-match, no re-enrollment",
+    "negative_verify": "right-middle verify-no-match",
+    "after_negative_retry": "right-index verify-match",
+    "duplicate_enrollment": "existing index rejected with enroll-duplicate",
+    "enrollment": "temporary right-middle 16stage enroll-completed, one enroll-retry-scan recovered",
+    "cleanup": "DeleteEnrolledFinger(right-middle-finger), confirmed only preexisting right-index remains",
+    "cleanup_evidence": "post-delete ListEnrolledFingers returned only right-index-finger"
+  },
+  "sudo": {
+    "command": [
+      "sudo",
+      "-k",
+      "/usr/bin/id",
+      "-u"
+    ],
+    "fingerprint_prompt": "Place your right index finger on the fingerprint reader",
+    "stdout": "0",
+    "exit": 0,
+    "password_entered": false,
+    "result": "fingerprint-only sudo successful"
+  },
+  "evidence_updated_at": "2026-11-08T14:45:11.999865+09:00",
+  "final_audit": {
+    "protected_system_files_changed": [],
+    "rpm_integrity": "passed",
+    "usb_acl": "user::rw-\ngroup::rw-\nother::r--\n\n",
+    "biometric_cleanup": "temporary RAM template freed; temporary system middle finger deleted; original right-index retained",
+    "selinux": "Enforcing",
+    "usb_acl_restored_exactly": true
+  },
+  "installation_recorded_at": "2026-11-08T14:43:46.134268+09:00",
+  "source_provenance": {
+    "description": "Recorded RPMs were built from the working tree based on 8747b45 before this change was committed. Driver, diagnostic and regression-test sources match the RPM source archive byte for byte. QA and documentation were finalized after the build; the recorded RPM hashes identify the installed and tested artifacts.",
+    "files_sha256": {
+      "libfprint/drivers/cs9711/cs9711.c": "9f0023da5bde951285a97f79838e5a1a28c9e8077bfc502556d51d3f73940245",
+      "libfprint/drivers/cs9711/cs9711.h": "fc303475b669253a1a0c571c262eb814e752a664746a8db597144cd1d5119ded",
+      "examples/cs9711-diag.c": "502a235d2e49e66b0ca7de61cee2b6cdb2e3c07ed30ae12de6020e95c66995d6",
+      "tests/test-cs9711-driver.c": "f11b0b4b4f71c5e295247be91f0d8b9228a4eccc592c2c760a99fc5d4247a98c"
+    }
+  }
+}

@@ -30,10 +30,15 @@
 
 #define CS9711_FRAME_SIZE (CS9711_WIDTH * CS9711_HEIGHT)
 
-/* 2541:2549 sends a plain 112x73 grayscale frame, then 16 pad bytes. */
+/* 2541:2549 sends one plain 112x88 grayscale frame (9856 bytes) per touch.
+ * Only the top 112x73 rows are turned into an image: the first Acl16
+ * support read 8192 bytes and used that crop, and stored prints were
+ * enrolled from it. */
 #define CS9711_ACL16_WIDTH 112
 #define CS9711_ACL16_HEIGHT 73
 #define CS9711_ACL16_IMAGE (CS9711_ACL16_WIDTH * CS9711_ACL16_HEIGHT)
+#define CS9711_ACL16_WIRE_HEIGHT 88
+#define CS9711_ACL16_WIRE_FRAME (CS9711_ACL16_WIDTH * CS9711_ACL16_WIRE_HEIGHT)
 #define CS9711_IMAGE_BUFFER_SIZE 8192
 
 struct _FpDeviceCs9711
@@ -56,15 +61,19 @@ struct _FpDeviceCs9711
   gboolean scan_delay_pending;
   gboolean deactivating;
 
-  /* Acl16 leaves extra bulk data queued after a frame. */
   guint8 acl16_drain_budget;
-  guint8 acl16_init_retries;
   guint8 acl16_rearms;
   guint8 acl16_echoes;
   int acl16_after_drain;
-  /* Monotonic time (us) before which no command may follow the last
-   * post-scan reset. Kept across actions and open/close of this object. */
-  gint64 acl16_reset_deadline;
+  /* Bytes of the current wire frame still queued after the frame read. */
+  gsize acl16_tail;
+  /* TRUE while no scan is outstanding and the bulk pipe holds no data:
+   * set once a whole frame was read and the reset was sent, or after the
+   * activation reset and drain. Cleared on open and when a scan is armed,
+   * so a cancelled or failed scan makes the next activation reset first. */
+  gboolean acl16_pipe_clean;
+  /* Monotonic time (us) of the last scan command, for debug timing. */
+  gint64 acl16_scan_sent_us;
 };
 
 G_DECLARE_FINAL_TYPE (FpDeviceCs9711, fpi_device_cs9711, FPI, DEVICE_CS9711, FpImageDevice)

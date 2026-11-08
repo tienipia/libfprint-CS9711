@@ -70,6 +70,11 @@ typedef struct
   gboolean      was_waiting;
   gboolean      was_present;
   gulong        status_handler;
+
+  /* Monotonic times (us) of the last "armed" and "contact" reports of the
+   * current operation, 0 if none yet; used only for timing fields. */
+  gint64        armed_us;
+  gint64        contact_us;
 } Diag;
 
 static Diag diag;
@@ -100,6 +105,13 @@ static double
 now_s (void)
 {
   return (g_get_monotonic_time () - diag.t0) / 1e6;
+}
+
+/* Seconds since @since_us, or -1 if that event did not happen. */
+static double
+since_s (gint64 since_us)
+{
+  return since_us ? (g_get_monotonic_time () - since_us) / 1e6 : -1.0;
 }
 
 /* emit ("event", "key", 's', "value", "key", 'i', 3, "key", 'b', TRUE,
@@ -252,14 +264,21 @@ on_finger_status (FpDevice *dev, GParamSpec *pspec, gpointer user_data)
       g_autofree char *attempt = diag.attempt ? g_strdup_printf (" #%u", diag.attempt) : NULL;
 
       /* For 2541:2549 this is reported only after the scan command has been
-       * sent, i.e. the sensor is armed now. */
-      emit ("waiting-for-contact", NULL);
+       * sent, i.e. the sensor is armed now. since_op_s: from the start of
+       * the operation; since_contact_s: from the previous frame of this
+       * operation (enroll stages), -1 for the first. */
+      emit ("waiting-for-contact",
+            "since_op_s", 'd', since_s (diag.op_t0),
+            "since_contact_s", 'd', since_s (diag.contact_us), NULL);
+      diag.armed_us = g_get_monotonic_time ();
       hint ("%s%s: sensor armed - place your finger now.",
             diag.op ? diag.op : "reader", attempt ? attempt : "");
     }
   if (present && !diag.was_present)
     {
-      emit ("contact", NULL);
+      /* For 2541:2549: when a whole frame arrived. */
+      emit ("contact", "since_armed_s", 'd', since_s (diag.armed_us), NULL);
+      diag.contact_us = g_get_monotonic_time ();
       hint ("Frame received - lift your finger.");
     }
 
@@ -273,6 +292,8 @@ op_begin (const char *op, guint attempt)
   diag.op = op;
   diag.attempt = attempt;
   diag.op_t0 = g_get_monotonic_time ();
+  diag.armed_us = 0;
+  diag.contact_us = 0;
   diag.timed_out = FALSE;
   g_clear_object (&diag.cancellable);
   diag.cancellable = g_cancellable_new ();
@@ -303,6 +324,7 @@ op_end (const char *success_outcome, GError *error)
         outcome = "error", code = EXIT_ERROR;
 
       emit ("result", "outcome", 's', outcome, "duration_s", 'd', duration,
+            "since_contact_s", 'd', since_s (diag.contact_us),
             "error_domain", 's', g_quark_to_string (error->domain),
             "error_code", 'i', error->code, "message", 's', error->message, NULL);
     }
@@ -310,7 +332,10 @@ op_end (const char *success_outcome, GError *error)
     {
       if (g_strcmp0 (outcome, "no-match") == 0)
         code = EXIT_NO_MATCH;
-      emit ("result", "outcome", 's', outcome, "duration_s", 'd', duration, NULL);
+      /* since_contact_s: last frame to result, i.e. reset, image
+       * processing and matching. */
+      emit ("result", "outcome", 's', outcome, "duration_s", 'd', duration,
+            "since_contact_s", 'd', since_s (diag.contact_us), NULL);
     }
 
   hint ("%s: %s%s%s", diag.op, outcome, error ? " - " : "", error ? error->message : "");
@@ -424,12 +449,14 @@ on_enroll_progress (FpDevice *dev, gint completed, FpPrint *print,
   if (error)
     {
       emit ("enroll-progress", "completed", 'i', completed, "total", 'i', total,
-            "retry", 's', error->message, NULL);
+            "retry", 's', error->message,
+            "since_contact_s", 'd', since_s (diag.contact_us), NULL);
       hint ("Stage not accepted (%s), try again.", error->message);
     }
   else
     {
-      emit ("enroll-progress", "completed", 'i', completed, "total", 'i', total, NULL);
+      emit ("enroll-progress", "completed", 'i', completed, "total", 'i', total,
+            "since_contact_s", 'd', since_s (diag.contact_us), NULL);
       hint ("Stage %d/%d accepted.", completed, total);
     }
 
@@ -477,9 +504,11 @@ static void
 on_match (FpDevice *dev, FpPrint *match, FpPrint *print, gpointer user_data, GError *error)
 {
   if (error)
-    emit ("match-report", "match", 's', NULL, "retry", 's', error->message, NULL);
+    emit ("match-report", "match", 's', NULL, "retry", 's', error->message,
+          "since_contact_s", 'd', since_s (diag.contact_us), NULL);
   else
-    emit ("match-report", "match", 'b', match != NULL, NULL);
+    emit ("match-report", "match", 'b', match != NULL,
+          "since_contact_s", 'd', since_s (diag.contact_us), NULL);
 }
 
 static int

@@ -68,7 +68,8 @@ make_texture (guint32 seed, gint width, gint height)
 }
 
 static const guint8 echo_scan[] = { 0xea, 0x04, 0x00, 0x00, 0x00, 0x00, 0x04, 0xea };
-static const guint8 acl16_init_reply[] = { 0xea, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0xea };
+/* What a 2541:2549 answered to an init command (chip id 0x62a2). */
+static const guint8 acl16_init_reply[] = { 0xea, 0x01, 0x62, 0xa2, 0x00, 0x00, 0xc1, 0xea };
 static const guint8 legacy_init_reply[] = CS9711_FP_CMD_STATE_RESULT_EXPECTED;
 
 /************************** Scripted transport ********************************/
@@ -113,7 +114,12 @@ typedef struct
   FakeRead *held;             /* read waiting for finger contact */
   guint     pending;          /* submitted, not yet completed reads */
   guint     holds;            /* reads that waited for contact */
-  guint     drain_reads;
+  guint     drain_reads;      /* Acl16 reads that wait for a quiet pipe */
+  guint     tail_reads;       /* Acl16 reads of a frame's last bytes */
+  gsize     drained_bytes;
+  /* Acl16: bytes the device has queued on the bulk pipe. A read takes what
+   * fits, like a bulk transfer; the rest stays for the next read. */
+  GByteArray *queued;
   gint      claimed;
   guint     claims;
   guint     releases;
@@ -130,9 +136,6 @@ typedef struct
   FakeHook  on_hold;          /* run from idle after a read starts waiting */
   FakeSendHook on_send;       /* run synchronously for every command */
   FakeHook  on_present;       /* run when finger presence is reported */
-
-  gint64    last_reset_us;     /* when the last RESET was sent */
-  gint64    min_after_reset_us; /* shortest gap from a RESET to the next command */
 
   gboolean  was_waiting;
   gboolean  was_present;
@@ -262,32 +265,46 @@ fake_reply_free (FakeReply *reply)
 static FakeReply *
 fake_default_reply (gsize length, guint timeout_ms)
 {
-  if (timeout_ms == CS9711_ACL16_DRAIN_TIMEOUT)
+  if (fake.acl16)
     {
-      g_assert_true (fake.acl16);
-      fake.drain_reads++;
+      if (timeout_ms == CS9711_ACL16_DRAIN_TIMEOUT)
+        fake.drain_reads++;
+      else if (timeout_ms == CS9711_DEFAULT_WAIT_TIMEOUT)
+        fake.tail_reads++;
+
+      /* Whatever is queued is delivered at once. */
+      if (fake.queued->len > 0)
+        {
+          gsize n = MIN (length, fake.queued->len);
+          FakeReply *reply = fake_reply_new (FAKE_DATA, fake.queued->data, n);
+
+          if (timeout_ms == CS9711_ACL16_DRAIN_TIMEOUT)
+            fake.drained_bytes += n;
+          g_byte_array_remove_range (fake.queued, 0, n);
+          return reply;
+        }
+
+      if (timeout_ms == CS9711_ACL16_SCAN_TIMEOUT)
+        {
+          /* Frames are always read whole. */
+          g_assert_cmpuint (length, ==, CS9711_ACL16_WIRE_FRAME);
+          return fake_reply_new (FAKE_HOLD, NULL, 0);
+        }
+
+      /* A drain or a frame tail with nothing queued. */
+      g_assert_true (timeout_ms == CS9711_ACL16_DRAIN_TIMEOUT ||
+                     timeout_ms == CS9711_DEFAULT_WAIT_TIMEOUT);
       return fake_reply_new (FAKE_TIMEOUT, NULL, 0);
     }
 
-  if (fake.acl16 && timeout_ms == CS9711_ACL16_SCAN_TIMEOUT)
-    {
-      g_assert_cmpuint (length, ==, CS9711_ACL16_FRAME);
-      return fake_reply_new (FAKE_HOLD, NULL, 0);
-    }
-
-  if (!fake.acl16 && timeout_ms == 0)
+  if (timeout_ms == 0)
     return fake_reply_new (FAKE_HOLD, NULL, 0);
 
   g_assert_cmpuint (timeout_ms, ==, CS9711_DEFAULT_WAIT_TIMEOUT);
   if (fake_last_sent () == CS9711_FP_CMD_TYPE_INIT)
-    {
-      if (fake.acl16)
-        return fake_reply_new (FAKE_DATA, acl16_init_reply, sizeof (acl16_init_reply));
-      return fake_reply_new (FAKE_DATA, legacy_init_reply, sizeof (legacy_init_reply));
-    }
+    return fake_reply_new (FAKE_DATA, legacy_init_reply, sizeof (legacy_init_reply));
 
   /* Legacy image tail */
-  g_assert_false (fake.acl16);
   g_assert_cmpuint (fake_last_sent (), ==, CS9711_FP_CMD_TYPE_SCAN);
   return fake_reply_new (FAKE_DATA, fake.frame + CS9711_FP_RECV_LEN_1, CS9711_FP_RECV_LEN_2);
 }
@@ -329,19 +346,10 @@ cs9711_io_send_sync (FpiUsbTransfer *transfer, guint timeout_ms, GError **error)
   cmd = buf[1];
   g_array_append_val (fake.sent, cmd);
 
-  /* Acl16: nothing may follow a post-scan reset within the settle time,
-   * not even across actions (real hardware stopped delivering frames). */
-  if (fake.acl16 && fake.last_reset_us)
-    {
-      gint64 gap = g_get_monotonic_time () - fake.last_reset_us;
-
-      g_assert_cmpint (gap, >=, (gint64) CS9711_DEFAULT_RESET_SLEEP * 1000);
-      if (fake.min_after_reset_us == 0 || gap < fake.min_after_reset_us)
-        fake.min_after_reset_us = gap;
-      fake.last_reset_us = 0;
-    }
-  if (cmd == CS9711_FP_CMD_TYPE_RESET)
-    fake.last_reset_us = g_get_monotonic_time ();
+  /* Neither vendor driver sends an init command to this id, and one sent
+   * right after a reset stopped the next scan from delivering frames. */
+  if (fake.acl16)
+    g_assert_cmpuint (cmd, !=, CS9711_FP_CMD_TYPE_INIT);
 
   if (fake.on_send)
     fake.on_send (cmd);
@@ -421,12 +429,21 @@ cs9711_io_submit (FpiUsbTransfer        *transfer,
   fake_reply_free (reply);
 }
 
-/* Deliver data to the read that waits for finger contact. */
+/* Deliver data to the read that waits for finger contact. What does not fit
+ * into that read stays queued on the Acl16 pipe. */
 static void
 fake_touch_with (const guint8 *data, gsize len)
 {
+  gsize n;
+
   g_assert_nonnull (fake.held);
-  fake_finish_later (fake.held, data, len, NULL);
+  n = MIN (len, fake.held->transfer->length);
+  if (n < len)
+    {
+      g_assert_true (fake.acl16);
+      g_byte_array_append (fake.queued, data + n, len - n);
+    }
+  fake_finish_later (fake.held, data, n, NULL);
 }
 
 static void
@@ -457,21 +474,28 @@ hook_cancel (guint count)
   g_cancellable_cancel (test_cancellable);
 }
 
+/* A 112x88 wire frame, optionally after an echo of the scan command. Only
+ * its top 112x73 rows are expected in the image; the bottom rows hold an
+ * unrelated texture so that using them would be noticed. */
 static void
 fake_set_acl16_frame (guint32 seed, gboolean with_echo)
 {
   gsize offset = with_echo ? CS9711_FP_CMD_LEN_1 : 0;
+  g_autofree guint8 *wire = make_texture (seed, CS9711_ACL16_WIDTH, CS9711_ACL16_WIRE_HEIGHT);
+  g_autofree guint8 *bottom = make_texture (seed + 1000, CS9711_ACL16_WIDTH, CS9711_ACL16_WIRE_HEIGHT);
 
   g_clear_pointer (&fake.frame, g_free);
   g_clear_pointer (&fake.expected, g_free);
 
-  fake.expected = make_texture (seed, CS9711_ACL16_WIDTH, CS9711_ACL16_HEIGHT);
+  memcpy (wire + CS9711_ACL16_IMAGE, bottom + CS9711_ACL16_IMAGE,
+          CS9711_ACL16_WIRE_FRAME - CS9711_ACL16_IMAGE);
+  fake.expected = g_memdup2 (wire, CS9711_ACL16_IMAGE);
   fake.expected_len = CS9711_ACL16_IMAGE;
-  fake.frame = g_malloc0 (CS9711_ACL16_FRAME);
-  fake.frame_len = CS9711_ACL16_FRAME;
+  fake.frame_len = offset + CS9711_ACL16_WIRE_FRAME;
+  fake.frame = g_malloc0 (fake.frame_len);
   if (with_echo)
     memcpy (fake.frame, echo_scan, sizeof (echo_scan));
-  memcpy (fake.frame + offset, fake.expected, CS9711_ACL16_IMAGE);
+  memcpy (fake.frame + offset, wire, CS9711_ACL16_WIRE_FRAME);
 }
 
 static void
@@ -501,6 +525,7 @@ fake_reset (gboolean acl16)
   while ((reply = g_queue_pop_head (&fake.replies)))
     fake_reply_free (reply);
   g_clear_pointer (&fake.sent, g_array_unref);
+  g_clear_pointer (&fake.queued, g_byte_array_unref);
   g_clear_pointer (&fake.frame, g_free);
   g_clear_pointer (&fake.expected, g_free);
   g_clear_error (&fake.release_error);
@@ -511,6 +536,7 @@ fake_reset (gboolean acl16)
   g_queue_init (&fake.replies);
   fake.acl16 = acl16;
   fake.sent = g_array_new (FALSE, FALSE, sizeof (guint8));
+  fake.queued = g_byte_array_new ();
   fake.claimed = -1;
   test_cancellable = g_cancellable_new ();
 
@@ -609,8 +635,6 @@ open_device (void)
     dev = g_object_new (test_cs9711_legacy_get_type (), NULL);
 
   g_signal_connect (dev, "notify::finger-status", G_CALLBACK (on_finger_status), NULL);
-  /* A new object does not know about resets sent through an older one. */
-  fake.last_reset_us = 0;
 
   g_assert_true (fp_device_open_sync (dev, NULL, &error));
   g_assert_no_error (error);
@@ -653,6 +677,17 @@ capture (FpDevice *dev, GError **error)
   g_assert_null (fake.held);
 
   return image;
+}
+
+/* Commands sent since @from, as a string such as "24" for SCAN, RESET. */
+static gchar *
+sent_since (guint from)
+{
+  GString *s = g_string_new (NULL);
+
+  for (guint i = from; i < fake.sent->len; i++)
+    g_string_append_printf (s, "%x", g_array_index (fake.sent, guint8, i));
+  return g_string_free (s, FALSE);
 }
 
 static void
@@ -714,26 +749,32 @@ verify (FpDevice *dev, FpPrint *template, guint32 seed, GError **error)
 static void
 test_classify (void)
 {
-  g_autofree guint8 *buf = g_malloc0 (CS9711_ACL16_FRAME);
+  g_autofree guint8 *buf = g_malloc0 (CS9711_ACL16_WIRE_FRAME);
   gsize offset = 99;
 
-  /* Echo followed by a frame */
+  /* A whole wire frame */
+  memset (buf, 0x55, CS9711_FP_CMD_LEN_1);
+  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_WIRE_FRAME, &offset), ==, CS9711_ACL16_PACKET_IMAGE);
+  g_assert_cmpuint (offset, ==, 0);
+
+  /* Echo followed by the start of a frame; its last 8 bytes are queued. */
   memcpy (buf, echo_scan, sizeof (echo_scan));
-  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_FRAME, &offset), ==, CS9711_ACL16_PACKET_IMAGE);
+  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_WIRE_FRAME, &offset), ==, CS9711_ACL16_PACKET_IMAGE);
   g_assert_cmpuint (offset, ==, CS9711_FP_CMD_LEN_1);
 
-  /* Frame without echo */
+  /* Pixels that only resemble an echo (ea x . . . . x ea) are pixels. */
+  memcpy (buf, (const guint8[]) { 0xea, 0xea, 0xe9, 0xeb, 0xea, 0xe8, 0xea, 0xea }, 8);
+  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_WIRE_FRAME, &offset), ==, CS9711_ACL16_PACKET_IMAGE);
+  g_assert_cmpuint (offset, ==, 0);
+
+  /* Frames that ended early are rejected, also those that would hold the
+   * 112x73 crop: the 8192 bytes earlier releases read, the bare crop, and
+   * one byte short of a frame. */
   memset (buf, 0x55, CS9711_FP_CMD_LEN_1);
-  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_FRAME, &offset), ==, CS9711_ACL16_PACKET_IMAGE);
+  g_assert_cmpint (cs9711_acl16_classify (buf, 8192, &offset), ==, CS9711_ACL16_PACKET_SHORT);
+  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_IMAGE, &offset), ==, CS9711_ACL16_PACKET_SHORT);
+  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_WIRE_FRAME - 1, &offset), ==, CS9711_ACL16_PACKET_SHORT);
   g_assert_cmpuint (offset, ==, 0);
-
-  /* Exactly one image without padding */
-  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_IMAGE, &offset), ==, CS9711_ACL16_PACKET_IMAGE);
-  g_assert_cmpuint (offset, ==, 0);
-
-  /* An echo plus an image that is one byte short */
-  memcpy (buf, echo_scan, sizeof (echo_scan));
-  g_assert_cmpint (cs9711_acl16_classify (buf, CS9711_ACL16_IMAGE + 7, &offset), ==, CS9711_ACL16_PACKET_SHORT);
 
   /* Echo of the scan command alone */
   g_assert_cmpint (cs9711_acl16_classify (echo_scan, sizeof (echo_scan), &offset), ==, CS9711_ACL16_PACKET_ECHO);
@@ -747,26 +788,30 @@ test_classify (void)
 static void
 test_acl16_capture (void)
 {
+  g_autofree gchar *cmds = NULL;
   FpDevice *dev;
-  const guint8 expected_cmds[] = {
-    CS9711_FP_CMD_TYPE_INIT, CS9711_FP_CMD_TYPE_SCAN, CS9711_FP_CMD_TYPE_RESET,
-    CS9711_FP_CMD_TYPE_INIT, CS9711_FP_CMD_TYPE_SCAN, CS9711_FP_CMD_TYPE_RESET,
-  };
 
   fake_reset (TRUE);
   dev = open_device ();
 
-  /* Frame preceded by the scan command echo, then a plain frame. */
+  /* The first activation after open stops whatever the sensor was doing
+   * and empties the pipe. Then: frame preceded by the scan command echo,
+   * then a plain frame. No init command. */
   fake_set_acl16_frame (7, TRUE);
   assert_capture_matches_frame (dev);
+  g_assert_cmpuint (fake.tail_reads, ==, 1);
+  g_assert_cmpuint (fake.queued->len, ==, 0);
   fake_set_acl16_frame (8, FALSE);
   assert_capture_matches_frame (dev);
 
-  g_assert_cmpmem (fake.sent->data, fake.sent->len, expected_cmds, sizeof (expected_cmds));
+  /* RESET, then SCAN and RESET per frame. The second action reuses the
+   * clean pipe: no reset and no drain before its scan. */
+  cmds = sent_since (0);
+  g_assert_cmpstr (cmds, ==, "24242");
+  g_assert_cmpuint (fake.drain_reads, ==, 1);
+  g_assert_cmpuint (fake.tail_reads, ==, 1);
   g_assert_cmpuint (fake.armed_reports, ==, 2);
   g_assert_cmpuint (fake.present_reports, ==, 2);
-  /* One drain before init and one after each frame. */
-  g_assert_cmpuint (fake.drain_reads, ==, 4);
 
   close_device (dev);
 }
@@ -788,9 +833,11 @@ test_acl16_enroll_verify (void)
   g_assert_no_error (error);
   g_assert_nonnull (enrolled);
   g_assert_cmpuint (enrolled->prints->len, ==, 15);
-  /* Init once, then one armed scan per stage. */
-  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_INIT), ==, 1);
+  /* One reset after open, then one armed scan and one reset per stage;
+   * the drain runs once. */
   g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 15);
+  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_RESET), ==, 16);
+  g_assert_cmpuint (fake.drain_reads, ==, 1);
   g_assert_cmpuint (fake.armed_reports, ==, 15);
 
   /* Same texture matches, a different one does not. */
@@ -817,7 +864,9 @@ test_acl16_cancel_waiting (void)
 {
   g_autoptr(GError) error = NULL;
   g_autoptr(FpImage) image = NULL;
+  g_autofree gchar *cmds = NULL;
   FpDevice *dev;
+  guint sent;
 
   fake_reset (TRUE);
   dev = open_device ();
@@ -829,15 +878,50 @@ test_acl16_cancel_waiting (void)
   g_assert_null (FPI_DEVICE_CS9711 (dev)->cancellable);
   g_assert_cmpuint (fp_device_get_finger_status (dev), ==, FP_FINGER_STATUS_NONE);
 
-  /* The device stays usable. */
+  /* The device stays usable. The cancelled scan may still be armed, so
+   * the next activation stops it and drains the pipe first. */
+  sent = fake.sent->len;
   assert_capture_matches_frame (dev);
+  cmds = sent_since (sent);
+  g_assert_cmpstr (cmds, ==, "242");
+  g_assert_cmpuint (fake.drain_reads, ==, 2);
   close_device (dev);
 }
 
 static void
-hook_cancel_on_init (guint8 cmd)
+test_acl16_stale_frame_after_cancel (void)
 {
-  if (cmd == CS9711_FP_CMD_TYPE_INIT)
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FpImage) image = NULL;
+  g_autofree guint8 *stale = NULL;
+  FpDevice *dev;
+
+  fake_reset (TRUE);
+  dev = open_device ();
+
+  fake.on_hold = hook_cancel;
+  image = capture (dev, &error);
+  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+  g_clear_error (&error);
+
+  /* Someone touched the sensor that was still armed: a whole frame waits
+   * on the pipe. It must be discarded, not returned for the next action. */
+  fake_set_acl16_frame (71, FALSE);
+  stale = g_memdup2 (fake.frame, fake.frame_len);
+  g_byte_array_append (fake.queued, stale, CS9711_ACL16_WIRE_FRAME);
+
+  fake_set_acl16_frame (72, FALSE);
+  assert_capture_matches_frame (dev);
+  g_assert_cmpuint (fake.drained_bytes, ==, CS9711_ACL16_WIRE_FRAME);
+  g_assert_cmpuint (fake.queued->len, ==, 0);
+
+  close_device (dev);
+}
+
+static void
+hook_cancel_on_first_command (guint8 cmd)
+{
+  if (fake.sent->len == 1)
     g_cancellable_cancel (test_cancellable);
 }
 
@@ -851,7 +935,8 @@ test_acl16_cancel_activation (void)
   fake_reset (TRUE);
   dev = open_device ();
 
-  fake.on_send = hook_cancel_on_init;
+  /* Cancelled right after the activation's reset. */
+  fake.on_send = hook_cancel_on_first_command;
   image = capture (dev, &error);
   g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
   g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 0);
@@ -861,23 +946,8 @@ test_acl16_cancel_activation (void)
   close_device (dev);
 }
 
-static gboolean
-cancel_timeout_cb (gpointer user_data)
-{
-  g_cancellable_cancel (test_cancellable);
-  return G_SOURCE_REMOVE;
-}
-
 static void
-hook_cancel_after_init_reply (guint8 cmd)
-{
-  /* Lands inside the settle delay that follows the init answer. */
-  if (cmd == CS9711_FP_CMD_TYPE_INIT)
-    g_timeout_add (CS9711_DEFAULT_RESET_SLEEP / 2, cancel_timeout_cb, NULL);
-}
-
-static void
-test_acl16_cancel_settle (void)
+test_acl16_cancel_drain (void)
 {
   g_autoptr(GError) error = NULL;
   g_autoptr(FpImage) image = NULL;
@@ -886,43 +956,57 @@ test_acl16_cancel_settle (void)
   fake_reset (TRUE);
   dev = open_device ();
 
-  fake.on_send = hook_cancel_after_init_reply;
+  /* The activation's drain read is still pending when the caller cancels;
+   * it is reaped and no scan is armed. */
+  g_queue_push_tail (&fake.replies, fake_reply_new (FAKE_HOLD, NULL, 0));
+  fake.on_hold = hook_cancel;
   image = capture (dev, &error);
   g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+  g_assert_null (image);
   g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 0);
 
-  fake.on_send = NULL;
   assert_capture_matches_frame (dev);
   close_device (dev);
 }
 
 static void
-hook_cancel_during_enroll_settle (guint count)
+hook_cancel_on_second_frame (guint count)
 {
-  /* The frame arrived; the driver now waits before submitting it. */
+  /* The second stage's frame arrived and was reported, but the reset and
+   * the image submission are still to come. */
   if (count == 2)
-    g_timeout_add (CS9711_DEFAULT_RESET_SLEEP / 2, cancel_timeout_cb, NULL);
+    g_cancellable_cancel (test_cancellable);
 }
 
 static void
-test_acl16_cancel_enroll_settle (void)
+test_acl16_cancel_enroll_stage (void)
 {
   g_autoptr(GError) error = NULL;
   g_autoptr(FpPrint) print = NULL;
+  g_autofree gchar *cmds = NULL;
   FpDevice *dev;
+  guint sent;
 
   fake_reset (TRUE);
   dev = open_device ();
 
-  fake.on_present = hook_cancel_during_enroll_settle;
+  fake.on_present = hook_cancel_on_second_frame;
   print = enroll (dev, 31, &error);
   g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
   g_assert_null (print);
-  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 2);
+  /* Reset after open, stage 1, stage 2 stopped before its reset. */
+  cmds = sent_since (0);
+  g_assert_cmpstr (cmds, ==, "2424");
   g_assert_null (FPI_DEVICE_CS9711 (dev)->scan_ssm);
+  g_clear_pointer (&cmds, g_free);
 
+  /* The second scan was not stopped by its reset, so the next activation
+   * resets and drains first. */
   fake.on_present = NULL;
+  sent = fake.sent->len;
   assert_capture_matches_frame (dev);
+  cmds = sent_since (sent);
+  g_assert_cmpstr (cmds, ==, "242");
   close_device (dev);
 }
 
@@ -939,6 +1023,7 @@ test_acl16_cancel_races_frame (void)
 {
   g_autoptr(GError) error = NULL;
   g_autoptr(FpImage) image = NULL;
+  g_autofree gchar *cmds = NULL;
   FpDevice *dev;
 
   fake_reset (TRUE);
@@ -948,11 +1033,17 @@ test_acl16_cancel_races_frame (void)
   image = capture (dev, &error);
   g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
   g_assert_null (image);
-  /* The aborted scan must not send the post-scan command or submit. */
-  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_RESET), ==, 0);
+  /* The aborted scan must not send the post-scan command or submit; the
+   * only reset is the one of the activation. */
+  cmds = sent_since (0);
+  g_assert_cmpstr (cmds, ==, "24");
   g_assert_cmpuint (fake.present_reports, ==, 0);
+  g_clear_pointer (&cmds, g_free);
 
+  /* That scan was not stopped: reset and drain before the next one. */
   assert_capture_matches_frame (dev);
+  cmds = sent_since (0);
+  g_assert_cmpstr (cmds, ==, "24242");
   close_device (dev);
 }
 
@@ -1086,17 +1177,21 @@ test_acl16_short_packets (void)
   g_autoptr(GError) error = NULL;
   g_autoptr(FpImage) image = NULL;
   g_autoptr(FpImage) none = NULL;
+  g_autofree gchar *cmds = NULL;
   FpDevice *dev;
 
   fake_reset (TRUE);
   dev = open_device ();
 
-  /* Unexpected short data: drain and arm again. */
+  /* Unexpected short data: stop the scan, drain and arm again. */
   fake.on_hold = hook_short_then_frame;
   image = capture (dev, &error);
   g_assert_no_error (error);
   g_assert_nonnull (image);
-  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 2);
+  cmds = sent_since (0);
+  g_assert_cmpstr (cmds, ==, "24242");
+  g_assert_cmpuint (fake.drain_reads, ==, 2);
+  g_assert_cmpuint (fake.present_reports, ==, 1);
 
   /* Re-arming is bounded. */
   fake.on_hold = hook_always_short;
@@ -1104,6 +1199,132 @@ test_acl16_short_packets (void)
   g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
   g_assert_null (none);
   g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 2 + 1 + CS9711_ACL16_MAX_REARMS);
+  g_assert_cmpuint (fake.present_reports, ==, 1);
+
+  close_device (dev);
+}
+
+static void
+hook_truncated_then_frame (guint count)
+{
+  /* First a frame cut where earlier releases assumed it ended. */
+  if (count == 1)
+    fake_touch_with (fake.frame, 8192);
+  else
+    fake_touch ();
+}
+
+static void
+test_acl16_truncated_frame (void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FpImage) image = NULL;
+  FpDevice *dev;
+
+  fake_reset (TRUE);
+  dev = open_device ();
+
+  /* The short frame is discarded, never submitted; the sensor is armed
+   * again and the next whole frame is used. */
+  fake_set_acl16_frame (81, FALSE);
+  fake.on_hold = hook_truncated_then_frame;
+  image = capture (dev, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (image);
+  g_assert_cmpmem (fp_image_get_data (image, NULL), CS9711_ACL16_IMAGE, fake.expected, CS9711_ACL16_IMAGE);
+  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 2);
+  g_assert_cmpuint (fake.present_reports, ==, 1);
+
+  close_device (dev);
+}
+
+static void
+hook_echo_frame_without_tail (guint count)
+{
+  /* The read fills up, but the frame's last bytes never arrive. */
+  fake_touch_with (fake.frame, CS9711_ACL16_WIRE_FRAME);
+}
+
+static void
+test_acl16_frame_tail_missing (void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FpImage) image = NULL;
+  g_autofree gchar *cmds = NULL;
+  FpDevice *dev;
+  guint sent;
+
+  fake_reset (TRUE);
+  dev = open_device ();
+
+  fake_set_acl16_frame (82, TRUE);
+  fake.on_hold = hook_echo_frame_without_tail;
+  g_test_expect_message (TEST_DOMAIN, G_LOG_LEVEL_WARNING, "*Acl16 frame incomplete*");
+  image = capture (dev, &error);
+  g_test_assert_expected_messages ();
+  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
+  g_assert_null (image);
+  g_assert_cmpuint (fake.tail_reads, ==, 1);
+  /* An incomplete frame is not reported as finger contact. */
+  g_assert_cmpuint (fake.present_reports, ==, 0);
+  g_clear_error (&error);
+
+  /* The pipe state is unknown now: reset and drain before the next scan. */
+  sent = fake.sent->len;
+  fake_set_acl16_frame (83, FALSE);
+  assert_capture_matches_frame (dev);
+  cmds = sent_since (sent);
+  g_assert_cmpstr (cmds, ==, "242");
+
+  close_device (dev);
+}
+
+static void
+test_acl16_echo_like_pixels (void)
+{
+  static const guint8 pattern[] = { 0xea, 0x04, 0x11, 0x22, 0x33, 0x44, 0x04, 0xea };
+  FpDevice *dev;
+
+  fake_reset (TRUE);
+  dev = open_device ();
+
+  /* A frame whose first pixels look like a command echo, but not like the
+   * exact scan echo: they are pixels, no tail is expected. */
+  fake_set_acl16_frame (84, FALSE);
+  memcpy (fake.frame, pattern, sizeof (pattern));
+  memcpy (fake.expected, pattern, sizeof (pattern));
+  assert_capture_matches_frame (dev);
+  g_assert_cmpuint (fake.tail_reads, ==, 0);
+  g_assert_cmpuint (fake.present_reports, ==, 1);
+
+  close_device (dev);
+}
+
+static void
+test_acl16_drain_never_quiet (void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FpImage) image = NULL;
+  g_autofree gchar *cmds = NULL;
+  FpDevice *dev;
+
+  fake_reset (TRUE);
+  dev = open_device ();
+
+  /* After the reset the pipe keeps delivering data: the activation fails
+   * instead of trusting the pipe, and nothing is armed. */
+  for (guint i = 0; i < CS9711_ACL16_DRAIN_BUDGET + 1; i++)
+    g_byte_array_append (fake.queued, fake.frame, CS9711_ACL16_WIRE_FRAME);
+  image = capture (dev, &error);
+  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
+  g_assert_null (image);
+  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 0);
+  g_assert_false (FPI_DEVICE_CS9711 (dev)->acl16_pipe_clean);
+
+  /* Once it is quiet, the next activation resets and drains again. */
+  assert_capture_matches_frame (dev);
+  cmds = sent_since (0);
+  g_assert_cmpstr (cmds, ==, "2242");
 
   close_device (dev);
 }
@@ -1132,6 +1353,7 @@ test_acl16_chained_actions (void)
   g_autoptr(GError) error = NULL;
   g_autoptr(FpImage) image = NULL;
   g_autoptr(FpPrint) enrolled = NULL;
+  g_autofree gchar *cmds = NULL;
   FpDevice *dev;
 
   fake_reset (TRUE);
@@ -1143,50 +1365,21 @@ test_acl16_chained_actions (void)
   image = capture (dev, &error);
   g_assert_no_error (error);
   g_assert_nonnull (image);
-  g_assert_cmpuint (fake.last_reset_us, !=, 0);
+  cmds = sent_since (0);
+  g_assert_cmpstr (cmds, ==, "242");
+  g_clear_pointer (&cmds, g_free);
 
   enrolled = enroll (dev, 61, &error);
   g_assert_no_error (error);
   g_assert_nonnull (enrolled);
   g_assert_cmpuint (enrolled->prints->len, ==, 15);
-  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_INIT), ==, 2);
-  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_SCAN), ==, 16);
-  /* The send hook asserted the gap after every reset; it was exercised. */
-  g_assert_cmpint (fake.min_after_reset_us, >=, (gint64) CS9711_DEFAULT_RESET_SLEEP * 1000);
+  /* Enrollment reuses the clean pipe: it arms at once, with no init,
+   * reset or drain in between, and stops each stage's scan. */
+  cmds = sent_since (3);
+  g_assert_cmpstr (cmds, ==, "424242424242424242424242424242");
+  g_assert_cmpuint (fake.drain_reads, ==, 1);
+  g_assert_cmpuint (fake.armed_reports, ==, 16);
 
-  close_device (dev);
-}
-
-static void
-test_acl16_cancel_post_reset_wait (void)
-{
-  g_autoptr(GError) error = NULL;
-  g_autoptr(FpImage) first = NULL;
-  g_autoptr(FpImage) second = NULL;
-  FpDevice *dev;
-  guint inits;
-
-  fake_reset (TRUE);
-  dev = open_device ();
-
-  fake.on_hold = hook_touch;
-  first = capture (dev, &error);
-  g_assert_no_error (error);
-  inits = fake_count_sent (CS9711_FP_CMD_TYPE_INIT);
-
-  /* Cancel while the next activation still waits after the reset. */
-  g_clear_object (&test_cancellable);
-  test_cancellable = g_cancellable_new ();
-  g_timeout_add (CS9711_DEFAULT_RESET_SLEEP / 4, cancel_timeout_cb, NULL);
-  second = fp_device_capture_sync (dev, TRUE, test_cancellable, &error);
-  flush_main_context ();
-  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
-  g_assert_null (second);
-  g_assert_cmpuint (fake_count_sent (CS9711_FP_CMD_TYPE_INIT), ==, inits);
-  g_assert_cmpuint (fake.pending, ==, 0);
-  g_clear_error (&error);
-
-  assert_capture_matches_frame (dev);
   close_device (dev);
 }
 
@@ -1319,18 +1512,22 @@ main (int argc, char **argv)
   add_test ("/cs9711/acl16/capture", test_acl16_capture);
   add_test ("/cs9711/acl16/enroll-verify", test_acl16_enroll_verify);
   add_test ("/cs9711/acl16/cancel-waiting", test_acl16_cancel_waiting);
+  add_test ("/cs9711/acl16/stale-frame-after-cancel", test_acl16_stale_frame_after_cancel);
   add_test ("/cs9711/acl16/cancel-activation", test_acl16_cancel_activation);
-  add_test ("/cs9711/acl16/cancel-settle", test_acl16_cancel_settle);
-  add_test ("/cs9711/acl16/cancel-enroll-settle", test_acl16_cancel_enroll_settle);
+  add_test ("/cs9711/acl16/cancel-drain", test_acl16_cancel_drain);
+  add_test ("/cs9711/acl16/cancel-enroll-stage", test_acl16_cancel_enroll_stage);
   add_test ("/cs9711/acl16/cancel-races-frame", test_acl16_cancel_races_frame);
   add_test ("/cs9711/acl16/scan-timeout", test_acl16_scan_timeout);
   add_test ("/cs9711/acl16/unplug", test_acl16_unplug);
   add_test ("/cs9711/acl16/send-failure", test_acl16_send_failure);
   add_test ("/cs9711/acl16/echo-then-frame", test_acl16_echo_then_frame);
   add_test ("/cs9711/acl16/short-packets", test_acl16_short_packets);
+  add_test ("/cs9711/acl16/truncated-frame", test_acl16_truncated_frame);
+  add_test ("/cs9711/acl16/frame-tail-missing", test_acl16_frame_tail_missing);
+  add_test ("/cs9711/acl16/echo-like-pixels", test_acl16_echo_like_pixels);
+  add_test ("/cs9711/acl16/drain-never-quiet", test_acl16_drain_never_quiet);
   add_test ("/cs9711/acl16/open-close-cycles", test_acl16_open_close_cycles);
   add_test ("/cs9711/acl16/chained-actions", test_acl16_chained_actions);
-  add_test ("/cs9711/acl16/cancel-post-reset-wait", test_acl16_cancel_post_reset_wait);
   add_test ("/cs9711/legacy/capture", test_legacy_capture);
   add_test ("/cs9711/legacy/cancel-waiting", test_legacy_cancel_waiting);
   add_test ("/cs9711/sigfm/fail-closed", test_sigfm_fail_closed);

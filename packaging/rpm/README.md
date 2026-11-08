@@ -1,5 +1,15 @@
 # libfprint-cs9711 RPM (Fedora 44, x86_64)
 
+Release 0.3 corrects the Acl16 wire frame to 9856 bytes and removes per-scan
+initialization and fixed 1500 ms waits. On this reader, operation start to
+scan armed measured 81 ms (3 samples), compared with 1599–1677 ms for 0.2.
+It is installed and has passed RAM-only enrollment, matching, existing
+fprintd template compatibility, different-finger rejection, 16-stage fprintd
+enrollment and fingerprint-only `sudo -k id -u`. The temporary middle-finger
+registration was removed; the existing index-finger registration remains. See [QA-0.3.json](QA-0.3.json)
+for exact artifact hashes and test status, and the
+[protocol research](../../libfprint/drivers/cs9711/acl16-protocol.md).
+
 Release 0.2 passed physical-device QA on Fedora 44 on 2026-11-08: fprintd
 enrollment, same-finger match, different-finger rejection and passwordless
 `sudo -k id -u`. [QA.json](QA.json) records the exact tested RPM hashes and

@@ -31,10 +31,8 @@ G_DEFINE_TYPE (FpDeviceCs9711, fpi_device_cs9711, FP_TYPE_IMAGE_DEVICE)
 #define CS9711_SENSOR_HEIGHT 236
 
 #define CS9711_DEFAULT_WAIT_TIMEOUT 300
-/* Legacy ids sleep this long before every scan command. Acl16 waits the same
- * time after the init command and, during enrollment, after each frame, so
- * that the device is armed when libfprint reports that a finger is needed.
- * Unit tests shorten it. */
+/* Legacy ids sleep this long before every scan command. Acl16 does not
+ * wait (see below). Unit tests shorten it. */
 #ifndef CS9711_DEFAULT_RESET_SLEEP
 #define CS9711_DEFAULT_RESET_SLEEP  1500
 #endif
@@ -47,17 +45,22 @@ G_DEFINE_TYPE (FpDeviceCs9711, fpi_device_cs9711, FP_TYPE_IMAGE_DEVICE)
 #define CS9711_FP_RECV_LEN_2   24
 #define CS9711_FP_RECV_LEN_MAX CS9711_FP_RECV_LEN_1
 
-/* 2541:2549 (USB FingPintAcl16) answers the same commands but returns one
- * 8192-byte bulk frame: 112x73 grayscale pixels and 16 bytes of padding.
- * The 68x118 deinterleave used by the other ids scrambles this image.
+/* 2541:2549 (USB FingPintAcl16) uses the same command framing, but needs no
+ * init command and answers a scan command with one 9856-byte (112x88) bulk
+ * frame once a finger touches the sensor. Both vendor drivers read exactly
+ * that length, reset right after it and may arm the next scan at once: a
+ * finger that stays down is not scanned again, only a new touch is (see
+ * acl16-protocol.md next to this file). The 68x118 deinterleave used by the
+ * other ids scrambles this image.
  */
 #define CS9711_ACL16_DRIVER_DATA 1
-#define CS9711_ACL16_FRAME       8192
 /* How long one armed scan waits for finger contact before the session fails.
  * Callers that need a shorter bound cancel the action. Unit tests shorten it. */
 #ifndef CS9711_ACL16_SCAN_TIMEOUT
 #define CS9711_ACL16_SCAN_TIMEOUT 180000
 #endif
+/* Only used when the pipe state is unknown (after open, a cancelled or a
+ * failed scan): read until nothing arrives for this long. */
 #define CS9711_ACL16_DRAIN_TIMEOUT 80
 #define CS9711_ACL16_DRAIN_BUDGET  6
 /* Bounds for unexpected short packets while waiting for a frame. */
@@ -325,25 +328,6 @@ cs9711_finish_deactivation (FpDeviceCs9711 *self)
   fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (self), NULL);
 }
 
-/* If the quiet period after the last Acl16 reset has not passed, re-enter
- * @state of @ssm once it should have and return TRUE. GLib timeouts are
- * measured from the main loop's cached time and may fire slightly early,
- * so the state checks the clock again when it is re-entered. */
-static gboolean
-cs9711_wait_for_reset_deadline (FpDeviceCs9711 *self, FpiSsm *ssm, int state)
-{
-  gint64 remaining = self->acl16_reset_deadline - g_get_monotonic_time ();
-  guint ms;
-
-  if (remaining <= 0)
-    return FALSE;
-
-  ms = (guint) ((remaining + 999) / 1000);
-  fp_dbg ("Acl16: waiting %u ms after the last reset", ms);
-  fpi_ssm_jump_to_state_delayed (ssm, state, ms);
-  return TRUE;
-}
-
 /************************** ACL16 FRAMES **************************************/
 
 typedef enum {
@@ -361,25 +345,30 @@ cs9711_is_command_echo (const guint8 *data, gsize len)
          data[0] == 0xea && data[7] == 0xea && data[1] == data[6];
 }
 
-/* Classify one bulk packet received while waiting for a scan. For an image,
- * *pixel_offset is where the 112x73 pixels start (an echo of the scan
- * command may precede them). */
+/* Classify the result of one CS9711_ACL16_WIRE_FRAME read made while
+ * waiting for a scan. Only a read that filled the whole buffer is a frame;
+ * a shorter one (e.g. the 8192 bytes assumed by earlier releases) is
+ * rejected. If an echo of the scan command preceded the frame, the frame
+ * starts at *pixel_offset and that many of its bytes are still queued. */
 static Cs9711Acl16Packet
 cs9711_acl16_classify (const guint8 *data, gsize len, gsize *pixel_offset)
 {
-  gsize offset = 0;
+  static const guint8 scan_echo[CS9711_FP_CMD_LEN_1] = {
+    0xea, CS9711_FP_CMD_TYPE_SCAN, 0, 0, 0, 0, CS9711_FP_CMD_TYPE_SCAN, 0xea,
+  };
 
-  if (cs9711_is_command_echo (data, len))
-    offset = CS9711_FP_CMD_LEN_1;
-
-  if (len - offset >= CS9711_ACL16_IMAGE)
+  *pixel_offset = 0;
+  if (len == CS9711_ACL16_WIRE_FRAME)
     {
-      *pixel_offset = offset;
+      /* Neither vendor driver expects an echo here, and a bright image
+       * corner can look like the loose pattern below: only the exact echo
+       * counts. */
+      if (memcmp (data, scan_echo, sizeof (scan_echo)) == 0)
+        *pixel_offset = CS9711_FP_CMD_LEN_1;
       return CS9711_ACL16_PACKET_IMAGE;
     }
 
-  *pixel_offset = 0;
-  if (len == CS9711_FP_CMD_LEN_1 && offset == CS9711_FP_CMD_LEN_1 &&
+  if (len == CS9711_FP_CMD_LEN_1 && cs9711_is_command_echo (data, len) &&
       data[1] == CS9711_FP_CMD_TYPE_SCAN)
     return CS9711_ACL16_PACKET_ECHO;
 
@@ -387,7 +376,8 @@ cs9711_acl16_classify (const guint8 *data, gsize len, gsize *pixel_offset)
 }
 
 /* Read until the bulk pipe is quiet, then jump to acl16_after_drain.
- * A timeout means there is nothing left queued.
+ * A timeout means there is nothing left queued; a pipe that is still busy
+ * after CS9711_ACL16_DRAIN_BUDGET more reads fails the state machine.
  */
 static void
 m_acl16_drain_cb (FpiUsbTransfer *transfer,
@@ -417,25 +407,40 @@ m_acl16_drain_cb (FpiUsbTransfer *transfer,
   fp_dbg ("Acl16 drained %ld leftover bytes", (long) transfer->actual_length);
   if (self->acl16_drain_budget == 0)
     {
-      fpi_ssm_jump_to_state (transfer->ssm, self->acl16_after_drain);
+      /* The pipe never became quiet; its state is still unknown. */
+      fpi_ssm_mark_failed (transfer->ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                     "Acl16 kept sending data after a reset"));
       return;
     }
   self->acl16_drain_budget--;
-  usb_read_exact (dev, transfer->ssm, CS9711_ACL16_FRAME, CS9711_ACL16_DRAIN_TIMEOUT, m_acl16_drain_cb, NULL);
+  usb_read_exact (dev, transfer->ssm, CS9711_ACL16_WIRE_FRAME, CS9711_ACL16_DRAIN_TIMEOUT, m_acl16_drain_cb, NULL);
+}
+
+static void
+cs9711_acl16_drain (FpDevice *dev, FpiSsm *ssm, int after_drain)
+{
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  self->acl16_drain_budget = CS9711_ACL16_DRAIN_BUDGET;
+  self->acl16_after_drain = after_drain;
+  usb_read_exact (dev, ssm, CS9711_ACL16_WIRE_FRAME, CS9711_ACL16_DRAIN_TIMEOUT, m_acl16_drain_cb, NULL);
 }
 
 /************************** INIT SSM *************************************/
 
+/* Acl16 runs the first four states, the other ids the remaining ones. */
 enum {
-  M_INIT_STATE_ACL16_POST_RESET_WAIT = 0,
-  M_INIT_STATE_DRAIN,
+  M_INIT_STATE_ACL16_START = 0,
+  M_INIT_STATE_ACL16_RESET,
+  M_INIT_STATE_ACL16_DRAIN,
+  M_INIT_STATE_ACL16_READY,
   M_INIT_STATE_SEND_INI_QUERY,
   M_INIT_STATE_RECOVER_READ_IGNORED,
   M_INIT_STATE_RECOVER_SEND_RESET,
   M_INIT_STATE_RECOVER_READ_IGNORED_RESET,
   M_INIT_STATE_RECOVER_SEND_INIT,
   M_INIT_STATE_RECEIVE_STATUS,
-  M_INIT_STATE_ACL16_SETTLE,
   M_INIT_STATE_COUNT,
 };
 
@@ -464,41 +469,20 @@ m_init_read_cb_check_expected (FpiUsbTransfer *transfer,
       fp_dbg ("Read %ld of requested %ld", (long) transfer->actual_length, (long) transfer->length);
       if (transfer->actual_length != CS9711_FP_CMD_LEN_1)
         {
-          /* Acl16 often still has the tail of the previous image queued. */
-          if (is_acl16 (dev) && self->acl16_init_retries < 2)
-            {
-              self->acl16_init_retries++;
-              fp_warn ("Acl16 init got %ld bytes, draining and retrying", (long) transfer->actual_length);
-              fpi_ssm_jump_to_state (transfer->ssm, M_INIT_STATE_DRAIN);
-            }
-          else
-            {
-              fp_warn ("Error; expected %lu bytes but got %ld, failing", (gulong) CS9711_FP_CMD_LEN_1, (long) transfer->actual_length);
-              error = g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                                   "Init: expected %lu bytes but got %ld",
-                                   (gulong) CS9711_FP_CMD_LEN_1, (long) transfer->actual_length);
-              fpi_ssm_mark_failed (transfer->ssm, error);
-            }
+          fp_warn ("Error; expected %lu bytes but got %ld, failing", (gulong) CS9711_FP_CMD_LEN_1, (long) transfer->actual_length);
+          error = g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                               "Init: expected %lu bytes but got %ld",
+                               (gulong) CS9711_FP_CMD_LEN_1, (long) transfer->actual_length);
+          fpi_ssm_mark_failed (transfer->ssm, error);
         }
       else if (memcmp (transfer->buffer, expected, CS9711_FP_CMD_LEN_1))
         {
-          self->acl16_init_retries = 0;
-          if (is_acl16 (dev))
-            {
-              /* Every Acl16 seen so far answers differently from the other
-               * ids; log the bytes so that the answer can be studied. */
-              g_autofree gchar *hex = cs9711_hex_prefix (transfer->buffer, transfer->actual_length);
-              fp_info ("Acl16 init response: %s", hex);
-            }
-          else if (!user_data_is_ignore_mismatch_if_non_null)
-            {
-              fp_warn ("Error; got different state response than expected, but don't understand it anyway, continuing");
-            }
+          if (!user_data_is_ignore_mismatch_if_non_null)
+            fp_warn ("Error; got different state response than expected, but don't understand it anyway, continuing");
           fpi_ssm_next_state (transfer->ssm);
         }
       else
         {
-          self->acl16_init_retries = 0;
           fp_dbg ("Init response valid");
           fpi_ssm_next_state (transfer->ssm);
         }
@@ -518,28 +502,36 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case M_INIT_STATE_ACL16_POST_RESET_WAIT:
-      /* On real hardware every scan that worked was armed at least
-       * CS9711_DEFAULT_RESET_SLEEP after the previous post-scan reset with
-       * no command in between. An init sent right after that reset (one
-       * action ending, the next starting, e.g. fprintd's duplicate check
-       * followed by enrollment) was answered, but the next scan never
-       * delivered a frame. Keep the same quiet period before init. */
-      if (is_acl16 (_dev) &&
-          cs9711_wait_for_reset_deadline (self, ssm, M_INIT_STATE_ACL16_POST_RESET_WAIT))
-        break;
-      fpi_ssm_next_state (ssm);
-      break;
-
-    case M_INIT_STATE_DRAIN:
+    case M_INIT_STATE_ACL16_START:
       if (!is_acl16 (_dev))
         {
-          fpi_ssm_next_state (ssm);
+          fpi_ssm_jump_to_state (ssm, M_INIT_STATE_SEND_INI_QUERY);
           break;
         }
-      self->acl16_drain_budget = CS9711_ACL16_DRAIN_BUDGET;
-      self->acl16_after_drain = M_INIT_STATE_SEND_INI_QUERY;
-      usb_read_exact (_dev, ssm, CS9711_ACL16_FRAME, CS9711_ACL16_DRAIN_TIMEOUT, m_acl16_drain_cb, NULL);
+      /* Acl16 needs no init command; neither vendor driver sends one
+       * before a scan, and one sent right after a reset stopped the next
+       * scan from delivering frames. A pipe left clean by the previous
+       * action is used as is. */
+      if (self->acl16_pipe_clean)
+        fpi_ssm_jump_to_state (ssm, M_INIT_STATE_ACL16_READY);
+      else
+        fpi_ssm_next_state (ssm);
+      break;
+
+    case M_INIT_STATE_ACL16_RESET:
+      /* A previous owner, or a scan that was cancelled or failed, may have
+       * left the sensor armed: stop it, then discard what it queued. */
+      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
+      m_util_fail_if_error_or_next (ssm, error);
+      break;
+
+    case M_INIT_STATE_ACL16_DRAIN:
+      cs9711_acl16_drain (_dev, ssm, M_INIT_STATE_ACL16_READY);
+      break;
+
+    case M_INIT_STATE_ACL16_READY:
+      self->acl16_pipe_clean = TRUE;
+      fpi_ssm_mark_completed (ssm);
       break;
 
     case M_INIT_STATE_SEND_INI_QUERY:
@@ -585,15 +577,6 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
       usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
       break;
 
-    case M_INIT_STATE_ACL16_SETTLE:
-      /* Wait here rather than before the scan command, so that the device
-       * is armed by the time libfprint reports that a finger is needed. */
-      if (is_acl16 (_dev))
-        fpi_ssm_next_state_delayed (ssm, CS9711_DEFAULT_RESET_SLEEP);
-      else
-        fpi_ssm_next_state (ssm);
-      break;
-
     default:
       g_assert_not_reached ();
     }
@@ -606,7 +589,7 @@ m_init_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
 
   /* libfprint ignores cancellation while a device is activating, so a
-   * cancellation that arrived during the settle delay is reported here. */
+   * cancellation that arrived while activating is reported here. */
   if (!error && g_cancellable_is_cancelled (self->cancellable))
     error = cs9711_cancelled_error ();
 
@@ -623,9 +606,10 @@ enum {
   M_SCAN_INIT_READ,
   M_SCAN_WAIT_FOR_READ_TO_COMPLETE,
   M_SCAN_GET_IMAGE_TAIL,
-  M_SCAN_ACL16_DRAIN,
+  M_SCAN_ACL16_RECOVER,
+  M_SCAN_ACL16_READ_TAIL,
+  M_SCAN_ACL16_FRAME_DONE,
   M_SCAN_SEND_POST_SCAN,
-  M_SCAN_ACL16_SETTLE,
   M_SCAN_IMAGE_COMPLETE,
   M_SCAN_STATE_COUNT,
 };
@@ -671,13 +655,13 @@ m_scan_read_cb_acl16 (FpiUsbTransfer *transfer,
   switch (packet)
     {
     case CS9711_ACL16_PACKET_IMAGE:
-      fp_dbg ("Acl16 frame received (%ld bytes, %s echo)",
-              (long) transfer->actual_length, offset ? "with" : "without");
+      fp_dbg ("Acl16 frame received (%ld bytes, %s echo) %.1f ms after the scan command",
+              (long) transfer->actual_length, offset ? "with" : "without",
+              (g_get_monotonic_time () - self->acl16_scan_sent_us) / 1000.0);
+      /* The top rows only; see CS9711_ACL16_HEIGHT. */
       memcpy (self->image_buffer, transfer->buffer + offset, CS9711_ACL16_IMAGE);
-      /* Acl16 only answers once a finger touches the sensor. */
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
-      self->acl16_after_drain = M_SCAN_SEND_POST_SCAN;
-      fpi_ssm_jump_to_state (transfer->ssm, M_SCAN_ACL16_DRAIN);
+      self->acl16_tail = offset;
+      fpi_ssm_jump_to_state (transfer->ssm, M_SCAN_ACL16_READ_TAIL);
       return;
 
     case CS9711_ACL16_PACKET_ECHO:
@@ -685,27 +669,67 @@ m_scan_read_cb_acl16 (FpiUsbTransfer *transfer,
         break;
       /* The device acknowledged the scan command; keep waiting. */
       fp_dbg ("Acl16 scan command echo, still waiting for finger contact");
-      usb_read_exact (dev, transfer->ssm, CS9711_ACL16_FRAME, CS9711_ACL16_SCAN_TIMEOUT, m_scan_read_cb_acl16, NULL);
+      usb_read_exact (dev, transfer->ssm, CS9711_ACL16_WIRE_FRAME, CS9711_ACL16_SCAN_TIMEOUT, m_scan_read_cb_acl16, NULL);
       return;
 
     case CS9711_ACL16_PACKET_SHORT:
       {
-        g_autofree gchar *hex = cs9711_hex_prefix (transfer->buffer, transfer->actual_length);
+        /* Never log more than a short prefix: this may be part of a frame. */
+        g_autofree gchar *hex = transfer->actual_length <= CS9711_FP_CMD_LEN_1 ?
+                                cs9711_hex_prefix (transfer->buffer, transfer->actual_length) :
+                                g_strdup ("not shown");
 
         if (++self->acl16_rearms > CS9711_ACL16_MAX_REARMS)
           break;
-        fp_dbg ("Acl16 short packet (%ld bytes: %s), draining and re-arming",
+        fp_dbg ("Acl16 short packet (%ld bytes: %s), resetting and re-arming",
                 (long) transfer->actual_length, hex);
-        self->acl16_after_drain = M_SCAN_INIT_READ;
-        fpi_ssm_jump_to_state (transfer->ssm, M_SCAN_ACL16_DRAIN);
+        fpi_ssm_jump_to_state (transfer->ssm, M_SCAN_ACL16_RECOVER);
         return;
       }
     }
 
   fpi_ssm_mark_failed (transfer->ssm,
                        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                 "Acl16 kept sending %ld-byte packets instead of a frame",
-                                                 (long) transfer->actual_length));
+                                                 "Acl16 kept sending %ld-byte packets instead of a %u-byte frame",
+                                                 (long) transfer->actual_length,
+                                                 (guint) CS9711_ACL16_WIRE_FRAME));
+}
+
+/* Completes a frame that followed an echo of the scan command. */
+static void
+m_scan_read_cb_acl16_tail (FpiUsbTransfer *transfer,
+                           FpDevice       *dev,
+                           gpointer        user_data,
+                           GError         *error)
+{
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+  (void) user_data;
+
+  if (cs9711_fail_if_aborting (self, transfer->ssm, error))
+    return;
+
+  if (!error && (gsize) transfer->actual_length != self->acl16_tail)
+    error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                      "Acl16 frame ended %lu bytes early",
+                                      (gulong) (self->acl16_tail - transfer->actual_length));
+  else if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
+    {
+      g_clear_error (&error);
+      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                        "Acl16 frame ended %lu bytes early",
+                                        (gulong) self->acl16_tail);
+    }
+
+  if (error)
+    {
+      fp_warn ("Acl16 frame incomplete: %s", error->message);
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  self->acl16_tail = 0;
+  fpi_ssm_next_state (transfer->ssm);
 }
 
 /* Read into FpDeviceCs9711->image_buffer if one of the two expected chunk sizes */
@@ -760,7 +784,7 @@ m_scan_read_cb_bulk (FpiUsbTransfer *transfer,
         {
           memcpy (offset, transfer->buffer, expected_size);
           if (user_data == M_SCAN_READ_CB_BULK_UD_SECOND_BLOCK)
-            /* The Acl16 drain does not apply to these ids. */
+            /* The Acl16 frame tail does not apply to these ids. */
             fpi_ssm_jump_to_state (transfer->ssm, M_SCAN_SEND_POST_SCAN);
           else
             fpi_ssm_next_state (transfer->ssm);
@@ -822,7 +846,8 @@ m_scan_state (FpiSsm *ssm, FpDevice *_dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case M_SCAN_INIT_SLEEP:
-      /* Acl16 already waited after init or after the previous frame. */
+      /* Acl16 arms at once, so libfprint reports that a finger is needed
+       * only after the scan command was sent. */
       if (is_acl16 (_dev))
         {
           fpi_ssm_next_state (ssm);
@@ -834,10 +859,18 @@ m_scan_state (FpiSsm *ssm, FpDevice *_dev)
 
     case M_SCAN_INIT_READ:
       if (is_acl16 (_dev))
-        usb_read_exact (_dev, ssm, CS9711_ACL16_FRAME, CS9711_ACL16_SCAN_TIMEOUT, m_scan_read_cb_acl16, NULL);
+        {
+          /* From here until the frame was read and the reset was sent, the
+           * pipe state is unknown if the scan ends early. */
+          self->acl16_pipe_clean = FALSE;
+          usb_read_exact (_dev, ssm, CS9711_ACL16_WIRE_FRAME, CS9711_ACL16_SCAN_TIMEOUT, m_scan_read_cb_acl16, NULL);
+        }
       else
-        usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_1, 0, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK);
+        {
+          usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_1, 0, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_FIRST_BLOCK);
+        }
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_SCAN, &error);
+      self->acl16_scan_sent_us = g_get_monotonic_time ();
       if (error)
         {
           /* The read is in flight and holds the SSM, so the SSM may only
@@ -863,34 +896,44 @@ m_scan_state (FpiSsm *ssm, FpDevice *_dev)
       usb_read_in (_dev, ssm, CS9711_FP_RECV_LEN_2, CS9711_DEFAULT_WAIT_TIMEOUT, m_scan_read_cb_bulk, M_SCAN_READ_CB_BULK_UD_SECOND_BLOCK);
       break;
 
-    case M_SCAN_ACL16_DRAIN:
+    case M_SCAN_ACL16_RECOVER:
+      /* Unexpected data instead of a frame: stop the scan, discard what is
+       * queued and arm again, as after open. */
       g_assert (is_acl16 (_dev));
-      self->acl16_drain_budget = CS9711_ACL16_DRAIN_BUDGET;
-      usb_read_exact (_dev, ssm, CS9711_ACL16_FRAME, CS9711_ACL16_DRAIN_TIMEOUT, m_acl16_drain_cb, NULL);
+      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
+      if (error)
+        {
+          fpi_ssm_mark_failed (ssm, error);
+          break;
+        }
+      cs9711_acl16_drain (_dev, ssm, M_SCAN_INIT_READ);
+      break;
+
+    case M_SCAN_ACL16_READ_TAIL:
+      g_assert (is_acl16 (_dev));
+      if (self->acl16_tail == 0)
+        {
+          fpi_ssm_next_state (ssm);
+          break;
+        }
+      /* The frame is being sent; its last bytes follow at once. */
+      usb_read_exact (_dev, ssm, self->acl16_tail, CS9711_DEFAULT_WAIT_TIMEOUT,
+                      m_scan_read_cb_acl16_tail, NULL);
+      break;
+
+    case M_SCAN_ACL16_FRAME_DONE:
+      /* Acl16 only answers once a finger touches the sensor; report it
+       * once the whole frame is in. */
+      fpi_image_device_report_finger_status (image_device, TRUE);
+      fpi_ssm_next_state (ssm);
       break;
 
     case M_SCAN_SEND_POST_SCAN:
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
-      if (is_acl16 (_dev))
-        self->acl16_reset_deadline = g_get_monotonic_time () +
-                                     (gint64) CS9711_DEFAULT_RESET_SLEEP * 1000;
+      /* Acl16: the whole frame was read and the scan is stopped. */
+      if (is_acl16 (_dev) && !error)
+        self->acl16_pipe_clean = TRUE;
       m_util_fail_if_error_or_next (ssm, error);
-      break;
-
-    case M_SCAN_ACL16_SETTLE:
-      /* During enrollment the next stage arms the sensor right after this
-       * image, so wait out the post-reset quiet period here; it also gives
-       * the user time to lift the finger. The image is submitted afterwards,
-       * so the last stage never leaves the device waiting for a finger-off
-       * report. Other actions end here; the next action's init waits. */
-      if (is_acl16 (_dev) &&
-          fpi_device_get_current_action (_dev) == FPI_DEVICE_ACTION_ENROLL &&
-          cs9711_wait_for_reset_deadline (self, ssm, M_SCAN_ACL16_SETTLE))
-        {
-          self->scan_delay_pending = TRUE;
-          break;
-        }
-      fpi_ssm_next_state (ssm);
       break;
 
     case M_SCAN_IMAGE_COMPLETE:
@@ -953,7 +996,6 @@ dev_activate (FpImageDevice *dev)
   FpiSsm *ssm;
 
   cs9711_begin_activation (self);
-  self->acl16_init_retries = 0;
 
   /* Start init ssm */
   ssm = fpi_ssm_new (FP_DEVICE (dev), m_init_state, M_INIT_STATE_COUNT);
@@ -998,6 +1040,7 @@ dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 
   self->acl16_rearms = 0;
   self->acl16_echoes = 0;
+  self->acl16_tail = 0;
 
   /* Start a capture operation. */
   ssm = fpi_ssm_new (FP_DEVICE (dev), m_scan_state, M_SCAN_STATE_COUNT);
@@ -1015,7 +1058,8 @@ dev_open (FpImageDevice *dev)
   memset (self->image_buffer, 0, sizeof (self->image_buffer));
   cs9711_end_activation (self);
   self->scan_ssm = NULL;
-  self->acl16_init_retries = 0;
+  /* Another process may have left the sensor armed or data queued. */
+  self->acl16_pipe_clean = FALSE;
 
   /* Claim usb interface. */
   cs9711_io_claim (FP_DEVICE (dev), cs9711_interface (FP_DEVICE (dev)), &error);
